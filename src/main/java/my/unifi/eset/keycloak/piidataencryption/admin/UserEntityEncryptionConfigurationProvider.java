@@ -23,8 +23,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import my.unifi.eset.keycloak.piidataencryption.listeners.EventListenerFactory;
+import my.unifi.eset.keycloak.piidataencryption.crypto.PiiCipher;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserProvider;
-import my.unifi.eset.keycloak.piidataencryption.utils.EncryptionUtils;
 import org.keycloak.Config;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.component.ComponentValidationException;
@@ -96,8 +96,12 @@ public class UserEntityEncryptionConfigurationProvider implements UiTabProvider,
             throw new ComponentValidationException("\nUser entity encryption cannot be enabled until \n(1) EncryptedUserProvider is enabled using --spi-user-provider=jpa-encrypted build/start flag \n(2) pii-data-encryption' event listener is added to the realm events setting");
         }
         try {
-            EncryptionUtils.encryptValue("test");
-        } catch (IllegalArgumentException ex) {
+            PiiCipher cipher = PiiCipher.getInstance();
+            String probe = cipher.encryptString("test", "configuration-validation");
+            if (!"test".equals(cipher.decryptString(probe, "configuration-validation"))) {
+                throw new IllegalStateException("the encrypted value could not be decrypted back");
+            }
+        } catch (IllegalArgumentException | IllegalStateException ex) {
             throw new ComponentValidationException("\nEncryption does not work due to the following error: " + ex.getMessage());
         }
     }

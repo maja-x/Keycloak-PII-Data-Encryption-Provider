@@ -56,9 +56,96 @@ RUN /opt/keycloak/bin/kc.sh build --db=mysql --features="declarative-ui" --spi-u
 
 ## How to use
 
-### Setting the encryption key
+### Configuring the encryption keys
 
-This provider requires the encryption key to be provided via environment variable **`KC_PII_ENCKEY`** and it needs to be **at least 16 characters long**. If the encryption key is not provided, however, there is a default fallback that uses MD5 hash of the database JDBC URL, either using configuration parameter `db-url` or environment variable `KC_DB_URL`. If you rely on this fallback and in the future need to migrate your Keycloak data into another databases that results in a different value of JDBC URL, you need to get the old value of JDBC URL, encode it using lowercased MD5 hash and set the value to the `KC_PII_ENCKEY` environment variable.
+Encryption is **envelope encryption**: every value is encrypted with its own random
+data key (DEK), and that data key is wrapped (encrypted) by a master key (KEK).
+Values are encrypted with AES-256-GCM, so the ciphertext is authenticated and
+bound to the user and field it belongs to through AAD (additional authenticated
+data). A keyed HMAC-SHA256 hash (blind index) is stored in place of each encrypted
+field so exact-match searches and the uniqueness checks still work.
+
+All keys are **versioned**. A key configuration is a comma-separated keyring in
+the format `v1:<key>,v2:<key>`, where each entry is prefixed with its version. New
+values always use the active version while older versions keep decrypting old
+data, so a key can be rotated without losing access to anything.
+
+| Environment variable | Purpose | Default |
+| --- | --- | --- |
+| `KC_PII_ENCKEY` | Master keys (KEK), e.g. `v1:<base64 key>` | MD5 hash of the database JDBC URL (see below) |
+| `KC_PII_ENCKEY_ACTIVE` | Master key version used for new data keys | last entry of `KC_PII_ENCKEY` |
+| `KC_PII_INDEXKEY` | Peppers for the blind index, same format | derived from the first master key |
+| `KC_PII_INDEXKEY_ACTIVE` | Pepper version used for new blind indexes | last entry of `KC_PII_INDEXKEY` |
+| `KC_PII_COUNTRY_CODE` | Country calling code used to normalize phone numbers for the blind index | `62` |
+
+Each key must be 16, 24 or 32 bytes. **32 bytes (AES-256) is recommended**, and
+keys can be generated with `openssl rand -base64 32`. Example:
+
+```shell
+export KC_PII_ENCKEY="v1:$(openssl rand -base64 32)"
+export KC_PII_INDEXKEY="v1:$(openssl rand -base64 32)"
+```
+
+If `KC_PII_ENCKEY` is not provided, there is a default fallback that uses the MD5
+hash of the database JDBC URL, either using configuration parameter `db-url` or
+environment variable `KC_DB_URL`. If you rely on this fallback and in the future
+need to migrate your Keycloak data into another database that results in a
+different JDBC URL, you need to get the old value of the JDBC URL, encode it using
+lowercased MD5 hash and set the value to the `KC_PII_ENCKEY` environment variable.
+
+If `KC_PII_INDEXKEY` is not set, the blind index pepper is derived from the first
+(oldest) master key so that a deployment only needs one variable. Set it
+explicitly to keep the pepper independent from the master keys.
+
+#### Upgrading from version 1.x
+
+Version 1.x encrypted values directly with `KC_PII_ENCKEY` and hashed the search
+columns with plain SHA-1. Both are still supported:
+
+- A key without a version prefix (e.g. `KC_PII_ENCKEY=1234567891123456`) is
+treated as the legacy key version `v0` and is still able to decrypt old values.
+- Old values are decrypted with the legacy algorithm and re-encrypted in the new
+  format the next time the user or attribute is written.
+- Old 40-character SHA-1 hashes are still recognised by lookups and decryption
+  verification until the rows are rewritten.
+
+#### Key rotation
+
+**Master key (KEK) rotation is cheap**: add a new key and mark it active, then
+re-wrap the data keys. The PII ciphertext is not touched.
+
+```shell
+# 1. add the new key (v1 stays so old values keep decrypting) and restart
+export KC_PII_ENCKEY="v1:<old key>,v2:<new key>"
+export KC_PII_ENCKEY_ACTIVE="v2"
+```
+
+```java
+// 2. per row: re-wrap the data key only (the ciphertext stays untouched), e.g.
+// from a maintenance script that reads USER_ENTITY_ENCRYPTED / USER_ATTRIBUTE_ENCRYPTED
+PiiCipher cipher = PiiCipher.getInstance();
+String stored = row.getEmail();                                      // $$$v1:v1:<wrapped DEK>:<ciphertext>
+String rewrapped = cipher.rewrapDataKey(ProtectedValue.parse(stored)).serialize();
+// UPDATE USER_ENTITY_ENCRYPTED SET EMAIL = :rewrapped WHERE ID = :id
+// rows already wrapped with the active key are returned unchanged by rewrapDataKey()
+```
+
+3. once no row references `v1` anymore, remove it from `KC_PII_ENCKEY`.
+
+A data key (DEK) rotation re-encrypts the value itself:
+
+```java
+ProtectedValue rotated = cipher.rotateDataKey(value, aad);   // new DEK, new ciphertext
+```
+
+The blind index is not affected by either rotation. Rotating the pepper is a
+plain re-index from the decrypted values: add the new pepper to
+`KC_PII_INDEXKEY`, make it active, and rewrite the hash columns with
+`LogicUtils.hash(...)` until no `v1:` hashes remain.
+
+> Removing a master key (or pepper) from the keyring makes every value that still
+> references it permanently unreadable. That is also how crypto-shredding works:
+> drop the key to irreversibly destroy the data.
 
 ### Enabling 'declarative-ui' feature
 
@@ -93,18 +180,23 @@ This provider also automatically encrypts any user attributes that have their na
 ### Verifying if the profile data are really encrypted (also explanations on how the encryptions work)
 
 1. Browse the Keycloak database using any tool (e.g. phpMyAdmin for MySQL database).
-2. Navigate to the table `USER_ENTITY`. Verify that the columns `USERNAME`, `EMAIL`, `FIRST_NAME` and `LAST_NAME` for the rows corresponding to users that have the encryption enabled will contain 40-characters of hexadecimal hash values, e.g. `6ea7bdc669b8926a75fe165989270ed025ac94dd`. Those hash values will be used for searching users based on those columns.
-3. Navigate to the table `USER_ENTITY_ENCRYPTED` to verify that those corresponding columns contain the encrypted values in the format of Base-64 strings that start with `$$$`, e.g. `$$$4SfpYL5c5rkn69b...` (the length may varies). Those encrypted values will be decrypted into the original values for Keycloak to show on UI or return in API responses.
-4. Navigate to the table `USER_ATTRIBUTE`. Verify that the column `VALUE` for the rows corresponding to user attributes that have the encryption enabled contains a 40-characters of hexadecimal hash value, similar to the columns in `USER_ENTITY` table.
-5. Navigate to the table `USER_ATTRIBUTE_ENCRYPTED` to find the corresponding `VALUE` column contains the Base-64 encrypted strings, similar to the columns in `USER_ENTITY_ENCRYPTED` table. 
+2. Navigate to the table `USER_ENTITY`. Verify that the columns `USERNAME`, `EMAIL`, `FIRST_NAME` and `LAST_NAME` for the rows corresponding to users that have the encryption enabled will contain versioned HMAC-SHA256 blind index values in the format `v1:<64 hex characters>`, e.g. `v1:6ea7bdc669b8926a75fe165989270ed025ac94dd45c571a156ddcef41351a713`. Those hashes are used for searching users and for the uniqueness constraints on those columns. Values written by version 1.x show up as plain 40-character SHA-1 hashes until the row is rewritten.
+3. Navigate to the table `USER_ENTITY_ENCRYPTED` to verify that those corresponding columns contain the encrypted values in the envelope format, e.g. `$$$v1:v1:<wrapped data key>:<ciphertext>` (the length varies). The first `v1` is the layout version, the second one (`v1`, `v2`, ...) is the version of the master key that wrapped the data key, and the rest is Base64.
+4. Navigate to the table `USER_ATTRIBUTE`. Verify that the column `VALUE` for the rows corresponding to user attributes that have the encryption enabled contains a blind index value, similar to the columns in `USER_ENTITY` table.
+5. Navigate to the table `USER_ATTRIBUTE_ENCRYPTED` to find the corresponding `VALUE` column contains the envelope-encrypted string, similar to the columns in `USER_ENTITY_ENCRYPTED` table.
+
+Because every value is authenticated with AES-GCM and bound to its user and field
+(AAD), a ciphertext copied to another row or another column will not decrypt and
+will be reported in the log as a decryption failure instead of being shown.
 
 ## Known issues/limitations
 
 1. Requires Keycloak version 24.x and above.
 2. [Unmanaged attributes](https://www.keycloak.org/docs/latest/server_admin/#_understanding-managed-and-unmanaged-attributes) are not supported.
-3. Encrypted user fields/attributes can only be searched using exact matches. Fuzzy-search is no longer possible for them.
+3. Encrypted user fields/attributes can only be searched using exact matches (the blind index is not reversible and does not support partial matches). Fuzzy-search is no longer possible for them.
 4. If the encrypted values in the database cannot be decrypted for whatever reason, the hashed value of the fields/attributes will be displayed as-is to the users and clients. This may cause confusions.
 5. If the `pii-data-encryption` validator is added to an existing attribute, the encryption is only applied to existing users' attribute data either when they are updated by the users, or if you switch the `Enable encryption` switch inside `User Entity Encryption` tab off and then on again.
+6. Rotating a master key requires re-wrapping the data keys of existing rows (see *Key rotation*). Old keys must stay in the keyring until that backfill is done.
 
 ## Your contributions will be very much appreciated
 

@@ -15,7 +15,7 @@
  */
 package my.unifi.eset.keycloak.piidataencryption.listeners;
 
-import my.unifi.eset.keycloak.piidataencryption.utils.EncryptionUtils;
+import my.unifi.eset.keycloak.piidataencryption.crypto.PiiCipher;
 import my.unifi.eset.keycloak.piidataencryption.utils.LogicUtils;
 import jakarta.persistence.EntityManager;
 import java.util.HashMap;
@@ -79,12 +79,13 @@ public class EntityListener implements Integrator, PreLoadEventListener {
             if (!LogicUtils.isHash((String) states[cols.get("username")])) {
                 // skip because the entity is already decrypted
                 logger.debugf("Event: USER_ALREADY_DECRYPTED, Realm: %s, User: %s", states[cols.get("realmId")], ue.getId());
-            } else if (validateHashValueVsEncryptedValue((String) states[cols.get("username")], eue.getUsername())) {
+            } else if (validateHashValueVsEncryptedValue((String) states[cols.get("username")], eue.getUsername(), LogicUtils.aad(ue.getId(), "username"))) {
                 logger.debugf("Event: USER_DECRYPTION, Realm: %s, User: %s", states[cols.get("realmId")], ue.getId());
-                states[cols.get("username")] = EncryptionUtils.decryptValue(eue.getUsername());
-                states[cols.get("email")] = EncryptionUtils.decryptValue(eue.getEmail());
-                states[cols.get("firstName")] = EncryptionUtils.decryptValue(eue.getFirstName());
-                states[cols.get("lastName")] = EncryptionUtils.decryptValue(eue.getLastName());
+                PiiCipher cipher = PiiCipher.getInstance();
+                states[cols.get("username")] = cipher.decryptString(eue.getUsername(), LogicUtils.aad(ue.getId(), "username"));
+                states[cols.get("email")] = cipher.decryptString(eue.getEmail(), LogicUtils.aad(ue.getId(), "email"));
+                states[cols.get("firstName")] = cipher.decryptString(eue.getFirstName(), LogicUtils.aad(ue.getId(), "firstName"));
+                states[cols.get("lastName")] = cipher.decryptString(eue.getLastName(), LogicUtils.aad(ue.getId(), "lastName"));
             } else {
                 throw new DecryptionFailureException((String) states[cols.get("realmId")], ue.getId());
             }
@@ -105,17 +106,18 @@ public class EntityListener implements Integrator, PreLoadEventListener {
         }
         UserEntity user = (UserEntity) states[cols.get("user")];
         EncryptedUserAttributeEntity euae = LogicUtils.getEncryptedUserAttributeEntity(em, user, String.valueOf(states[cols.get("name")]), false);
+        String userAttributeAad = LogicUtils.attributeAad(user.getId(), euae != null ? euae.getName() : String.valueOf(states[cols.get("name")]));
         if (euae != null) {
             // if record exist, decrypt it and set as value column
-            if (validateHashValueVsEncryptedValue((String) states[cols.get(valueColumn)], euae.getValue())) {
+            if (validateHashValueVsEncryptedValue((String) states[cols.get(valueColumn)], euae.getValue(), userAttributeAad)) {
                 logger.debugf("Event: USER_ATTRIBUTE_DECRYPTION, Realm: %s, User: %s, Attribute: %s", user.getRealmId(), user.getId(), states[cols.get("name")]);
-                states[cols.get(valueColumn)] = EncryptionUtils.decryptValue(euae.getValue());
+                states[cols.get(valueColumn)] = PiiCipher.getInstance().decryptString(euae.getValue(), userAttributeAad);
             } else {
                 throw new DecryptionFailureException(user.getRealmId(), user.getId(), (String) states[cols.get("name")]);
             }
-        } else if (EncryptionUtils.isEncryptedValue(String.valueOf(states[cols.get("value")]))) {
+        } else if (PiiCipher.isProtected(String.valueOf(states[cols.get("value")]))) {
             // if the value column is encrypted value (backward compatibility with version 1.x)
-            states[cols.get("value")] = EncryptionUtils.decryptValue(String.valueOf(states[cols.get("value")]));
+            states[cols.get("value")] = PiiCipher.getInstance().decryptString(String.valueOf(states[cols.get("value")]), userAttributeAad);
         }
     }
 
@@ -134,8 +136,8 @@ public class EntityListener implements Integrator, PreLoadEventListener {
      * @param encryptedValue The encrypted value String
      * @return True if matches, false otherwise
      */
-    public static boolean validateHashValueVsEncryptedValue(String hash, String encryptedValue) {
-        return hash.equalsIgnoreCase(LogicUtils.hash(EncryptionUtils.decryptValue(encryptedValue)));
+    public static boolean validateHashValueVsEncryptedValue(String hash, String encryptedValue, String aad) {
+        return LogicUtils.matchesHash(hash, PiiCipher.getInstance().decryptString(encryptedValue, aad));
     }
 
 }

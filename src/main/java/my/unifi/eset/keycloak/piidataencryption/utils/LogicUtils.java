@@ -20,10 +20,12 @@ import jakarta.persistence.NoResultException;
 import jakarta.persistence.Query;
 import java.util.List;
 import my.unifi.eset.keycloak.piidataencryption.admin.PiiDataEncryptionValidatorProvider;
+import my.unifi.eset.keycloak.piidataencryption.crypto.BlindIndex;
+import my.unifi.eset.keycloak.piidataencryption.crypto.PiiCipher;
+import my.unifi.eset.keycloak.piidataencryption.crypto.PiiKind;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserAttributeEntity;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserEntity;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserProvider;
-import org.apache.commons.codec.digest.DigestUtils;
 import org.jboss.logging.Logger;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
@@ -90,7 +92,7 @@ public final class LogicUtils {
      * @return true if should encrypted, false if not
      */
     public static boolean shouldEncryptAttribute(KeycloakSession ks, String realmId, String attributeName) {
-        if (!isUserEncryptionEnabled(ks, realmId)) {
+        if (attributeName == null || !isUserEncryptionEnabled(ks, realmId)) {
             return false;
         }
         if (attributeName.startsWith("pii-")) {
@@ -225,10 +227,11 @@ public final class LogicUtils {
             // somehow the value is already hashed so we skip it to avoid double hash/encrypt
             return;
         }
-        eue.setUsername(EncryptionUtils.encryptValue(ue.getUsername()));
-        eue.setEmail(EncryptionUtils.encryptValue(ue.getEmail()));
-        eue.setFirstName(EncryptionUtils.encryptValue(ue.getFirstName()));
-        eue.setLastName(EncryptionUtils.encryptValue(ue.getLastName()));
+        PiiCipher cipher = PiiCipher.getInstance();
+        eue.setUsername(cipher.encryptString(ue.getUsername(), aad(ue.getId(), "username")));
+        eue.setEmail(cipher.encryptString(ue.getEmail(), aad(ue.getId(), "email")));
+        eue.setFirstName(cipher.encryptString(ue.getFirstName(), aad(ue.getId(), "firstName")));
+        eue.setLastName(cipher.encryptString(ue.getLastName(), aad(ue.getId(), "lastName")));
         em.persist(eue);
         Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
         update.setParameter("id", ue.getId());
@@ -260,7 +263,7 @@ public final class LogicUtils {
                 return;
             }
             EncryptedUserAttributeEntity euae = getEncryptedUserAttributeEntity(em, uae.getUser(), uae.getName(), true);
-            euae.setValue(EncryptionUtils.encryptValue(value));
+            euae.setValue(PiiCipher.getInstance().encryptString(value, attributeAad(uae.getUser().getId(), uae.getName())));
             euae.setAttribute(uae);
             em.persist(euae);
             if (value.length() > 255) {
@@ -313,21 +316,23 @@ public final class LogicUtils {
      */
     public static void decryptUserEntity(EntityManager em, RealmModel realm, EncryptedUserEntity eue) {
         UserEntity user = eue.getUser();
-        if (!user.getUsername().equalsIgnoreCase(EncryptionUtils.decryptValue(eue.getUsername()))) {
+        PiiCipher cipher = PiiCipher.getInstance();
+        String username = cipher.decryptString(eue.getUsername(), aad(user.getId(), "username"));
+        if (!user.getUsername().equalsIgnoreCase(username)) {
             throw new DecryptionFailureException(realm.getId(), user.getId());
         }
         Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
         update.setParameter("id", user.getId());
-        update.setParameter("username", EncryptionUtils.decryptValue(eue.getUsername()));
-        String decryptedEmail = EncryptionUtils.decryptValue(eue.getEmail());
+        update.setParameter("username", username);
+        String decryptedEmail = cipher.decryptString(eue.getEmail(), aad(user.getId(), "email"));
         update.setParameter("email", decryptedEmail);
         if (!realm.isDuplicateEmailsAllowed()) {
             update.setParameter("emailConstraint", decryptedEmail);
         } else {
             update.setParameter("emailConstraint", user.getEmailConstraint()); // basically no change
         }
-        update.setParameter("firstName", EncryptionUtils.decryptValue(eue.getFirstName()));
-        update.setParameter("lastName", EncryptionUtils.decryptValue(eue.getLastName()));
+        update.setParameter("firstName", cipher.decryptString(eue.getFirstName(), aad(user.getId(), "firstName")));
+        update.setParameter("lastName", cipher.decryptString(eue.getLastName(), aad(user.getId(), "lastName")));
         update.executeUpdate();
         em.remove(eue);
     }
@@ -341,10 +346,10 @@ public final class LogicUtils {
      */
     public static void decryptUserAttributeEntity(EntityManager em, RealmModel realm, EncryptedUserAttributeEntity euae) {
         UserAttributeEntity uae = euae.getAttribute();
-        if (!uae.getValue().equalsIgnoreCase(EncryptionUtils.decryptValue(euae.getValue()))) {
+        String value = PiiCipher.getInstance().decryptString(euae.getValue(), attributeAad(euae.getUser().getId(), euae.getName()));
+        if (!value.equalsIgnoreCase(uae.getValue())) {
             throw new DecryptionFailureException(realm.getId(), euae.getUser().getId(), euae.getName());
         }
-        String value = EncryptionUtils.decryptValue(euae.getValue());
         if (value.length() > 255) {
             Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = null, u.longValue = :longValue, u.longValueHash = :longValueHash, u.longValueHashLowerCase = :longValueHashLowerCase WHERE u.id = :id");
             update.setParameter("id", uae.getId());
@@ -362,17 +367,61 @@ public final class LogicUtils {
     }
 
     /**
-     * Generates the hash value to be store in place of the plain text value
+     * Builds the AAD that binds an encrypted user field to its user and field
+     * name.
      *
-     * @param raw The plain text value
-     * @return The hash of the input raw
+     * @param userId The user ID
+     * @param field The field name
+     * @return The AAD
      */
-    public static String hash(String raw) {
-        return raw != null ? DigestUtils.sha1Hex(raw.trim().toLowerCase()) : null;
+    public static String aad(String userId, String field) {
+        return PiiCipher.fieldContext("user", userId, field);
     }
 
+    /**
+     * Builds the AAD that binds an encrypted user attribute to its user and
+     * attribute name.
+     *
+     * @param userId The user ID
+     * @param attributeName The attribute name
+     * @return The AAD
+     */
+    public static String attributeAad(String userId, String attributeName) {
+        return PiiCipher.fieldContext("user", userId, "attribute:" + attributeName);
+    }
+
+    /**
+     * Generates the blind index to be stored in place of the plain text value.
+     * The hash is an HMAC-SHA256 keyed with the configured pepper, so matching
+     * can only be done by Keycloak and not by whoever gets hold of the database.
+     *
+     * @param raw The plain text value
+     * @return The blind index of the input raw
+     */
+    public static String hash(String raw) {
+        return PiiCipher.getInstance().search(raw, PiiKind.GENERIC);
+    }
+
+    /**
+     * Checks whether a stored value is a blind index, either the HMAC-SHA256
+     * format of this version or the SHA-1 format of version 1.x.
+     *
+     * @param value The value to check
+     * @return true if the value is a blind index
+     */
     public static boolean isHash(String value) {
-        return value.length() == 40 && value.matches("^[0-9a-fA-F]+$");
+        return BlindIndex.isHash(value);
+    }
+
+    /**
+     * Checks whether a stored blind index matches a plain text value.
+     *
+     * @param storedHash The hash stored in the database
+     * @param raw The plain text value
+     * @return true if the hash matches the value
+     */
+    public static boolean matchesHash(String storedHash, String raw) {
+        return raw != null && PiiCipher.getInstance().matchesHash(storedHash, raw, PiiKind.GENERIC);
     }
 
     // Makes this class un-instantiatable
