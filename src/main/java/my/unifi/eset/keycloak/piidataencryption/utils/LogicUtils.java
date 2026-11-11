@@ -16,6 +16,7 @@
 package my.unifi.eset.keycloak.piidataencryption.utils;
 
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
 import jakarta.persistence.NoResultException;
 import jakarta.persistence.Query;
 import java.util.List;
@@ -194,18 +195,57 @@ public final class LogicUtils {
      * @param realm The RealmModel to encrypt all of its users
      */
     public static void encryptExistingUserEntities(KeycloakSession ks, EntityManager em, RealmModel realm) {
-        List<UserEntity> realmUsers = em.createQuery("SELECT u FROM UserEntity u WHERE u.realmId = :realmId", UserEntity.class).setParameter("realmId", realm.getId()).getResultList();
+        final int BATCH_SIZE = 25;
+
+        List<UserEntity> realmUsers = em.createQuery("SELECT u FROM UserEntity u WHERE u.realmId = :realmId", UserEntity.class)
+                .setParameter("realmId", realm.getId())
+                .getResultList();
         logger.debugf("Event: REALM_USERS_ENCRYPTION, Realm: %s, Total Users: %s", realm.getId(), realmUsers.size());
-        for (UserEntity user : realmUsers) {
-            if (user.getServiceAccountClientLink() != null) {
-                continue; // skip service accounts
+
+        int successCount = 0;
+        int failureCount = 0;
+
+        for (int i = 0; i < realmUsers.size(); i++) {
+            UserEntity user = realmUsers.get(i);
+
+            try {
+                if (user.getServiceAccountClientLink() != null) {
+                    continue; // skip service accounts
+                }
+
+                // Start database transaction
+                if (!em.getTransaction().isActive()) {
+                    em.getTransaction().begin();
+                }
+
+                encryptUserEntity(ks, em, user);
+                logger.debugf("Event: USER_ENCRYPTION, Realm: %s, User: %s", realm.getId(), user.getId());
+
+                for (UserAttributeEntity uae : user.getAttributes()) {
+                    encryptUserAttributeEntity(ks, em, uae);
+                }
+
+                em.flush();
+                em.getTransaction().commit();
+                successCount++;
+
+            } catch (Exception ex) {
+                failureCount++;
+                if (em.getTransaction().isActive()) {
+                    em.getTransaction().rollback();
+                }
+                logger.errorf("Failed to encrypt user %s in realm %s: %s", user.getId(), realm.getId(), ex.getMessage());
             }
-            encryptUserEntity(ks, em, user);
-            logger.debugf("Event: USER_ENCRYPTION, Realm: %s, User: %s", realm.getId(), user.getId());
-            for (UserAttributeEntity uae : user.getAttributes()) {
-                encryptUserAttributeEntity(ks, em, uae);
+
+            // Batch clear to prevent memory bloat
+            if ((i + 1) % BATCH_SIZE == 0) {
+                em.clear();
+                logger.debugf("Batch processed: %d/%d users", i + 1, realmUsers.size());
             }
         }
+
+        logger.infof("Event: REALM_USERS_ENCRYPTION_COMPLETE, Realm: %s, Success: %d, Failure: %d",
+                realm.getId(), successCount, failureCount);
     }
 
     /**
@@ -222,6 +262,12 @@ public final class LogicUtils {
         if (!LogicUtils.isUserEncryptionEnabled(ks, ue.getRealmId())) {
             return;
         }
+        // Re-fetch and lock the user entity to prevent concurrent modifications
+        ue = em.find(UserEntity.class, ue.getId(), LockModeType.PESSIMISTIC_WRITE);
+        if (ue == null) {
+            return;
+        }
+
         EncryptedUserEntity eue = LogicUtils.getEncryptedUserEntity(em, ue, true);
         if (isHash(ue.getUsername())) {
             // somehow the value is already hashed so we skip it to avoid double hash/encrypt
@@ -229,19 +275,29 @@ public final class LogicUtils {
         }
         PiiCipher cipher = PiiCipher.getInstance();
         eue.setUsername(cipher.encryptString(ue.getUsername(), aad(ue.getId(), "username")));
-        eue.setEmail(cipher.encryptString(ue.getEmail(), aad(ue.getId(), "email")));
+
+        // Handle null email safely
+        String emailToEncrypt = ue.getEmail() != null ? ue.getEmail() : "";
+        eue.setEmail(cipher.encryptString(emailToEncrypt, aad(ue.getId(), "email")));
+
         eue.setFirstName(cipher.encryptString(ue.getFirstName(), aad(ue.getId(), "firstName")));
         eue.setLastName(cipher.encryptString(ue.getLastName(), aad(ue.getId(), "lastName")));
         em.persist(eue);
+
         Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
         update.setParameter("id", ue.getId());
         update.setParameter("username", hash(ue.getUsername()));
-        String emailHash = hash(ue.getEmail());
+        
+        // Handle email hash safely
+        String emailHash = null;
+        if (ue.getEmail() != null && !ue.getEmail().isBlank()) {
+            emailHash = hash(ue.getEmail());
+        }
         update.setParameter("email", emailHash);
+        
+        // Handle emailConstraint with unique constraint consideration
         if (!ks.realms().getRealm(ue.getRealmId()).isDuplicateEmailsAllowed()) {
-            //update.setParameter("emailConstraint", emailHash);
-            // Only hash emailConstraint if the user actually has an email
-            if (ue.getEmail() != null && !ue.getEmail().isBlank()) {
+            if (emailHash != null) {
                 update.setParameter("emailConstraint", emailHash);
             } else {
                 // Preserve the original UUID emailConstraint for users without email
@@ -250,6 +306,7 @@ public final class LogicUtils {
         } else {
             update.setParameter("emailConstraint", ue.getEmailConstraint());
         }
+        
         update.setParameter("firstName", hash(ue.getFirstName()));
         update.setParameter("lastName", hash(ue.getLastName()));
         update.executeUpdate();
