@@ -239,7 +239,14 @@ public final class LogicUtils {
         String emailHash = hash(ue.getEmail());
         update.setParameter("email", emailHash);
         if (!ks.realms().getRealm(ue.getRealmId()).isDuplicateEmailsAllowed()) {
-            update.setParameter("emailConstraint", emailHash);
+            //update.setParameter("emailConstraint", emailHash);
+            // Only hash emailConstraint if the user actually has an email
+            if (ue.getEmail() != null && !ue.getEmail().isBlank()) {
+                update.setParameter("emailConstraint", emailHash);
+            } else {
+                // Preserve the original UUID emailConstraint for users without email
+                update.setParameter("emailConstraint", ue.getEmailConstraint());
+            }
         } else {
             update.setParameter("emailConstraint", ue.getEmailConstraint());
         }
