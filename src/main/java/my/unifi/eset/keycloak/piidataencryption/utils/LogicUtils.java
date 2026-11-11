@@ -195,8 +195,6 @@ public final class LogicUtils {
      * @param realm The RealmModel to encrypt all of its users
      */
     public static void encryptExistingUserEntities(KeycloakSession ks, EntityManager em, RealmModel realm) {
-        final int BATCH_SIZE = 25;
-
         List<UserEntity> realmUsers = em.createQuery("SELECT u FROM UserEntity u WHERE u.realmId = :realmId", UserEntity.class)
                 .setParameter("realmId", realm.getId())
                 .getResultList();
@@ -213,11 +211,6 @@ public final class LogicUtils {
                     continue; // skip service accounts
                 }
 
-                // Start database transaction
-                if (!em.getTransaction().isActive()) {
-                    em.getTransaction().begin();
-                }
-
                 encryptUserEntity(ks, em, user);
                 logger.debugf("Event: USER_ENCRYPTION, Realm: %s, User: %s", realm.getId(), user.getId());
 
@@ -225,22 +218,11 @@ public final class LogicUtils {
                     encryptUserAttributeEntity(ks, em, uae);
                 }
 
-                em.flush();
-                em.getTransaction().commit();
                 successCount++;
 
             } catch (Exception ex) {
                 failureCount++;
-                if (em.getTransaction().isActive()) {
-                    em.getTransaction().rollback();
-                }
                 logger.errorf("Failed to encrypt user %s in realm %s: %s", user.getId(), realm.getId(), ex.getMessage());
-            }
-
-            // Batch clear to prevent memory bloat
-            if ((i + 1) % BATCH_SIZE == 0) {
-                em.clear();
-                logger.debugf("Batch processed: %d/%d users", i + 1, realmUsers.size());
             }
         }
 
@@ -262,11 +244,6 @@ public final class LogicUtils {
         if (!LogicUtils.isUserEncryptionEnabled(ks, ue.getRealmId())) {
             return;
         }
-        // Re-fetch and lock the user entity to prevent concurrent modifications
-        ue = em.find(UserEntity.class, ue.getId(), LockModeType.PESSIMISTIC_WRITE);
-        if (ue == null) {
-            return;
-        }
 
         EncryptedUserEntity eue = LogicUtils.getEncryptedUserEntity(em, ue, true);
         if (isHash(ue.getUsername())) {
@@ -280,8 +257,11 @@ public final class LogicUtils {
         String emailToEncrypt = ue.getEmail() != null ? ue.getEmail() : "";
         eue.setEmail(cipher.encryptString(emailToEncrypt, aad(ue.getId(), "email")));
 
-        eue.setFirstName(cipher.encryptString(ue.getFirstName(), aad(ue.getId(), "firstName")));
-        eue.setLastName(cipher.encryptString(ue.getLastName(), aad(ue.getId(), "lastName")));
+        String firstName = ue.getFirstName() != null ? ue.getFirstName() : "";
+        String lastName = ue.getLastName() != null ? ue.getLastName() : "";
+
+        eue.setFirstName(cipher.encryptString(firstName, aad(ue.getId(), "firstName")));
+        eue.setLastName(cipher.encryptString(lastName, aad(ue.getId(), "lastName")));
         em.persist(eue);
 
         Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
@@ -307,8 +287,8 @@ public final class LogicUtils {
             update.setParameter("emailConstraint", ue.getEmailConstraint());
         }
         
-        update.setParameter("firstName", hash(ue.getFirstName()));
-        update.setParameter("lastName", hash(ue.getLastName()));
+        update.setParameter("firstName", hash(firstName));
+        update.setParameter("lastName", hash(lastName));
         update.executeUpdate();
     }
 
