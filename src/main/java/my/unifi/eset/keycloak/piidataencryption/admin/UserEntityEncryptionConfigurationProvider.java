@@ -132,10 +132,8 @@ public class UserEntityEncryptionConfigurationProvider implements UiTabProvider,
             toEncrypt = false;
         }
         if (!toEncrypt) {
-            EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
-            em.setFlushMode(FlushModeType.COMMIT);
-            LogicUtils.decryptExistingUserEntities(em, realm);
-            em.flush();
+            KeycloakSessionFactory ksf = session.getKeycloakSessionFactory();
+            LogicUtils.decryptExistingUserEntities(ksf, realm);
         }
     }
 

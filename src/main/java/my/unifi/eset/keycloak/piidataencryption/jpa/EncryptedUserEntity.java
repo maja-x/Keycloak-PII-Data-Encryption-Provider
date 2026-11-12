@@ -37,16 +37,16 @@ public class EncryptedUserEntity {
     @JoinColumn(name = "USER_ID")
     protected UserEntity user;
 
-    @Column(name = "EMAIL", length = 500)
+    @Column(name = "EMAIL")
     protected String email;
 
-    @Column(name = "USERNAME", length = 500)
+    @Column(name = "USERNAME")
     protected String username;
 
-    @Column(name = "FIRST_NAME", length = 500)
+    @Column(name = "FIRST_NAME")
     protected String firstName;
 
-    @Column(name = "LAST_NAME", length = 500)
+    @Column(name = "LAST_NAME")
     protected String lastName;
 
     public EncryptedUserEntity() {

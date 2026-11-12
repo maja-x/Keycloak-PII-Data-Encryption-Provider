@@ -19,6 +19,7 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.NoResultException;
 import jakarta.persistence.Query;
+import java.util.Arrays;
 import java.util.List;
 import my.unifi.eset.keycloak.piidataencryption.admin.PiiDataEncryptionValidatorProvider;
 import my.unifi.eset.keycloak.piidataencryption.crypto.BlindIndex;
@@ -28,7 +29,9 @@ import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserAttributeEntity
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserEntity;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserProvider;
 import org.jboss.logging.Logger;
+import org.keycloak.connections.jpa.JpaConnectionProvider;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserProvider;
 import org.keycloak.models.jpa.entities.UserAttributeEntity;
@@ -93,7 +96,21 @@ public final class LogicUtils {
      * @return true if should encrypted, false if not
      */
     public static boolean shouldEncryptAttribute(KeycloakSession ks, String realmId, String attributeName) {
-        if (attributeName == null || !isUserEncryptionEnabled(ks, realmId)) {
+        return shouldEncryptAttribute(ks, realmId, attributeName, false);
+    }
+
+    /**
+     * Checks if a particular user attribute should be encrypted or not
+     *
+     * @param ks KeycloakSession
+     * @param realmId The ID of the realm
+     * @param attributeName The name of the user attribute
+     * @param force True to ignore whether the encryption is enabled for the
+     * realm
+     * @return true if should encrypted, false if not
+     */
+    public static boolean shouldEncryptAttribute(KeycloakSession ks, String realmId, String attributeName, boolean force) {
+        if (attributeName == null || (!force && !isUserEncryptionEnabled(ks, realmId))) {
             return false;
         }
         if (attributeName.startsWith("pii-")) {
@@ -121,7 +138,20 @@ public final class LogicUtils {
      * @return true if should encrypted, false if not
      */
     public static boolean shouldEncryptAttribute(KeycloakSession ks, UserAttributeEntity userAttributeEntity) {
-        return shouldEncryptAttribute(ks, userAttributeEntity.getUser().getRealmId(), userAttributeEntity.getName());
+        return shouldEncryptAttribute(ks, userAttributeEntity, false);
+    }
+
+    /**
+     * Checks if a particular user attribute should be encrypted or not
+     *
+     * @param ks KeycloakSession
+     * @param userAttributeEntity The UserAttributeEntity
+     * @param force True to ignore whether the encryption is enabled for the
+     * realm
+     * @return true if should encrypted, false if not
+     */
+    public static boolean shouldEncryptAttribute(KeycloakSession ks, UserAttributeEntity userAttributeEntity, boolean force) {
+        return shouldEncryptAttribute(ks, userAttributeEntity.getUser().getRealmId(), userAttributeEntity.getName(), force);
     }
 
     /**
@@ -188,46 +218,104 @@ public final class LogicUtils {
     }
 
     /**
-     * Encrypts all existing user entities under a specific realm
+     * Number of processed users after which the progress of the migration is
+     * logged, so a realm with thousands of users does not look stuck.
+     */
+    private static final int ENCRYPTION_PROGRESS_INTERVAL = 100;
+
+    /**
+     * Encrypts all existing user entities under a specific realm.
+     *
+     * <p>Each user is encrypted in its own transaction instead of all of them in
+     * the transaction of the caller. A realm can have thousands of users, and
+     * processing them in one transaction means keeping every user entity and its
+     * row locks in the session until the request ends, and, because databases
+     * such as PostgreSQL abort the whole transaction on the first failed
+     * statement, a single user that cannot be encrypted makes every following
+     * user fail with "current transaction is aborted" and leaves nothing behind.
+     * With one transaction per user, the failure is reported against the user
+     * that caused it while the users processed before it stay encrypted. Since an
+     * already encrypted user is detected and skipped, the migration can simply be
+     * run again to process the remaining users.</p>
      *
      * @param ks KeycloakSession
      * @param em EntityManager
      * @param realm The RealmModel to encrypt all of its users
      */
     public static void encryptExistingUserEntities(KeycloakSession ks, EntityManager em, RealmModel realm) {
-        List<UserEntity> realmUsers = em.createQuery("SELECT u FROM UserEntity u WHERE u.realmId = :realmId", UserEntity.class)
-                .setParameter("realmId", realm.getId())
+        String realmId = realm.getId();
+        List<String> userIds = em.createQuery("SELECT u.id FROM UserEntity u WHERE u.realmId = :realmId ORDER BY u.id", String.class)
+                .setParameter("realmId", realmId)
                 .getResultList();
-        logger.debugf("Event: REALM_USERS_ENCRYPTION, Realm: %s, Total Users: %s", realm.getId(), realmUsers.size());
+        logger.infof("Event: REALM_USERS_ENCRYPTION_START, Realm: %s, Total Users: %d", realmId, userIds.size());
 
-        int successCount = 0;
+        KeycloakSessionFactory ksf = ks.getKeycloakSessionFactory();
+        int encryptedCount = 0;
+        int skippedCount = 0;
         int failureCount = 0;
+        String firstFailedUser = null;
 
-        for (int i = 0; i < realmUsers.size(); i++) {
-            UserEntity user = realmUsers.get(i);
-
+        for (String userId : userIds) {
             try {
-                if (user.getServiceAccountClientLink() != null) {
-                    continue; // skip service accounts
+                if (Boolean.TRUE.equals(KeycloakModelUtils.runJobInTransactionWithResult(ksf, session -> encryptUserInOwnTransaction(session, userId)))) {
+                    encryptedCount++;
+                } else {
+                    skippedCount++;
                 }
-
-                encryptUserEntity(ks, em, user);
-                logger.debugf("Event: USER_ENCRYPTION, Realm: %s, User: %s", realm.getId(), user.getId());
-
-                for (UserAttributeEntity uae : user.getAttributes()) {
-                    encryptUserAttributeEntity(ks, em, uae);
-                }
-
-                successCount++;
-
-            } catch (Exception ex) {
+            } catch (RuntimeException ex) {
                 failureCount++;
-                logger.errorf("Failed to encrypt user %s in realm %s: %s", user.getId(), realm.getId(), ex.getMessage());
+                if (firstFailedUser == null) {
+                    firstFailedUser = userId;
+                }
+                logger.errorf(ex, "Failed to encrypt user %s in realm %s, its transaction has been rolled back", userId, realmId);
+            }
+
+            int processed = encryptedCount + skippedCount + failureCount;
+            if (processed % ENCRYPTION_PROGRESS_INTERVAL == 0) {
+                logger.infof("Event: REALM_USERS_ENCRYPTION_PROGRESS, Realm: %s, Processed: %d/%d, Encrypted: %d, Skipped: %d, Failed: %d",
+                        realmId, processed, userIds.size(), encryptedCount, skippedCount, failureCount);
             }
         }
 
-        logger.infof("Event: REALM_USERS_ENCRYPTION_COMPLETE, Realm: %s, Success: %d, Failure: %d",
-                realm.getId(), successCount, failureCount);
+        logger.infof("Event: REALM_USERS_ENCRYPTION_COMPLETE, Realm: %s, Encrypted: %d, Skipped: %d, Failed: %d",
+                realmId, encryptedCount, skippedCount, failureCount);
+
+        if (failureCount > 0) {
+            throw new IllegalStateException(String.format("Encrypted %d user(s) of realm %s, but %d user(s) failed, the first one being %s, "
+                    + "so the realm configuration has not been saved. Fix the errors reported in the log for that user and save again: users that "
+                    + "are already encrypted are skipped, so only the remaining users will be processed.",
+                    encryptedCount, realmId, failureCount, firstFailedUser));
+        }
+    }
+
+    /**
+     * Encrypts a single user and its attributes in the transaction of the passed
+     * session. The encryption is forced instead of being read from the realm
+     * attribute, because that attribute is only saved by the caller after all
+     * users have been processed.
+     *
+     * @param session The KeycloakSession of the transaction to use
+     * @param userId The ID of the user to encrypt
+     * @return true if the user was encrypted, false if it was skipped
+     */
+    private static boolean encryptUserInOwnTransaction(KeycloakSession session, String userId) {
+        EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
+        UserEntity user = em.find(UserEntity.class, userId);
+        if (user == null) {
+            logger.warnf("Event: USER_ENCRYPTION_SKIPPED_NOT_FOUND, User: %s", userId);
+            return false;
+        }
+        if (user.getServiceAccountClientLink() != null) {
+            logger.debugf("Event: USER_ENCRYPTION_SKIPPED_SERVICE_ACCOUNT, User: %s", userId);
+            return false; // service accounts do not have PII to encrypt
+        }
+        encryptUserEntity(session, em, user, true);
+        for (UserAttributeEntity uae : user.getAttributes()) {
+            encryptUserAttributeEntity(session, em, uae, true);
+        }
+        em.flush();
+        logger.debugf("Event: USER_ENCRYPTION, Realm: %s, User: %s", user.getRealmId(), userId);
+        return true;
     }
 
     /**
@@ -238,10 +326,29 @@ public final class LogicUtils {
      * @param ue The UserEntity to encrypt
      */
     public static void encryptUserEntity(KeycloakSession ks, EntityManager em, UserEntity ue) {
+        encryptUserEntity(ks, em, ue, false);
+    }
+
+    /**
+     * Encrypts an existing user entity
+     *
+     * @param ks KeycloakSession
+     * @param em EntityManager
+     * @param ue The UserEntity to encrypt
+     * @param force True to encrypt even when the encryption is not enabled for
+     * the realm yet, e.g. while the configuration is still being saved
+     */
+    public static void encryptUserEntity(KeycloakSession ks, EntityManager em, UserEntity ue, boolean force) {
         if (ue == null) {
             return;
         }
-        if (!LogicUtils.isUserEncryptionEnabled(ks, ue.getRealmId())) {
+        if (!force && !LogicUtils.isUserEncryptionEnabled(ks, ue.getRealmId())) {
+            return;
+        }
+
+        // Re-fetch and lock the user entity to prevent concurrent modifications
+        ue = em.find(UserEntity.class, ue.getId(), LockModeType.PESSIMISTIC_WRITE);
+        if (ue == null) {
             return;
         }
 
@@ -254,27 +361,34 @@ public final class LogicUtils {
         eue.setUsername(cipher.encryptString(ue.getUsername(), aad(ue.getId(), "username")));
 
         // Handle null email safely
-        String emailToEncrypt = ue.getEmail() != null ? ue.getEmail() : "";
-        eue.setEmail(cipher.encryptString(emailToEncrypt, aad(ue.getId(), "email")));
+        String emailNormalized = ue.getEmail() != null ? ue.getEmail().trim() : "";
+        if (emailNormalized.isBlank()) {
+            emailNormalized = "";
+        }
+        eue.setEmail(cipher.encryptString(emailNormalized, aad(ue.getId(), "email")));
 
-        String firstName = ue.getFirstName() != null ? ue.getFirstName() : "";
-        String lastName = ue.getLastName() != null ? ue.getLastName() : "";
+        String firstName = ue.getFirstName() != null ? ue.getFirstName().trim() : "";
+        String lastName = ue.getLastName() != null ? ue.getLastName().trim() : "";
+        if (firstName.isBlank()) {
+            firstName = "";
+        }
+        if (lastName.isBlank()) {
+            lastName = "";
+        }
 
         eue.setFirstName(cipher.encryptString(firstName, aad(ue.getId(), "firstName")));
         eue.setLastName(cipher.encryptString(lastName, aad(ue.getId(), "lastName")));
         em.persist(eue);
+        em.flush(); // Ensure the encrypted entity is persisted before updating the original user entity
 
         Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
         update.setParameter("id", ue.getId());
         update.setParameter("username", hash(ue.getUsername()));
         
         // Handle email hash safely
-        String emailHash = null;
-        if (ue.getEmail() != null && !ue.getEmail().isBlank()) {
-            emailHash = hash(ue.getEmail());
-        }
+        String emailHash = emailNormalized.isEmpty() ? null : hash(emailNormalized);
         update.setParameter("email", emailHash);
-        
+
         // Handle emailConstraint with unique constraint consideration
         if (!ks.realms().getRealm(ue.getRealmId()).isDuplicateEmailsAllowed()) {
             if (emailHash != null) {
@@ -300,55 +414,133 @@ public final class LogicUtils {
      * @param uae The UserAttributeEntity to encrypt
      */
     public static void encryptUserAttributeEntity(KeycloakSession ks, EntityManager em, UserAttributeEntity uae) {
-        if (shouldEncryptAttribute(ks, uae)) {
-            String value = uae.getValue();
-            if (isHash(value)) {
-                // somehow the value is already hashed so we skip it to avoid double hash/encrypt
-                return;
-            }
-            EncryptedUserAttributeEntity euae = getEncryptedUserAttributeEntity(em, uae.getUser(), uae.getName(), true);
-            euae.setValue(PiiCipher.getInstance().encryptString(value, attributeAad(uae.getUser().getId(), uae.getName())));
-            euae.setAttribute(uae);
-            em.persist(euae);
-            if (value.length() > 255) {
-                Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = null, u.longValue = :longValue, u.longValueHash = :longValueHash, u.longValueHashLowerCase = :longValueHashLowerCase WHERE u.id = :id");
-                update.setParameter("id", uae.getId());
-                update.setParameter("longValue", hash(value));
-                update.setParameter("longValueHash", JpaHashUtils.hashForAttributeValue(value));
-                update.setParameter("longValueHashLowerCase", JpaHashUtils.hashForAttributeValueLowerCase(value));
-                update.executeUpdate();
-            } else {
-                Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = :value, u.longValue = null, u.longValueHash = null, u.longValueHashLowerCase = null WHERE u.id = :id");
-                update.setParameter("id", uae.getId());
-                update.setParameter("value", hash(value));
-                update.executeUpdate();
-            }
-        }
+        encryptUserAttributeEntity(ks, em, uae, false);
+    }
+
+    /**
+     * Encrypts an existing user attribute entity
+     *
+     * @param ks KeycloakSession
+     * @param em EntityManager
+     * @param uae The UserAttributeEntity to encrypt
+     * @param force True to encrypt even when the encryption is not enabled for
+     * the realm yet, e.g. while the configuration is still being saved
+     */
+    public static void encryptUserAttributeEntity(KeycloakSession ks, EntityManager em, UserAttributeEntity uae, boolean force) {
+      if (shouldEncryptAttribute(ks, uae, force)) {
+          String value = uae.getValue();
+          
+          // Null/empty safety check
+          if (value == null || value.isEmpty()) {
+              return;
+          }
+          
+          if (isHash(value)) {
+              // somehow the value is already hashed so we skip it to avoid double hash/encrypt
+              return;
+          }
+          
+          // Re-fetch and lock the attribute entity to prevent concurrent modifications
+          UserAttributeEntity lockedUae = em.find(UserAttributeEntity.class, uae.getId(), LockModeType.PESSIMISTIC_WRITE);
+          if (lockedUae == null || lockedUae.getValue() == null) {
+              logger.debugf("Event: ATTRIBUTE_ENCRYPTION_SKIPPED_NOT_FOUND, User: %s, Attribute: %s", uae.getUser().getId(), uae.getName());
+              return;
+          }
+          
+          // Use the locked entity's value
+          value = lockedUae.getValue();
+          
+          EncryptedUserAttributeEntity euae = getEncryptedUserAttributeEntity(em, lockedUae.getUser(), lockedUae.getName(), true);
+          String encryptedValue = PiiCipher.getInstance().encryptString(value, attributeAad(lockedUae.getUser().getId(), lockedUae.getName()));
+          euae.setValue(encryptedValue);
+          euae.setAttribute(lockedUae);
+          em.persist(euae);
+          em.flush(); // Ensure encrypted entity is persisted before updating original
+          
+          // Generate consistent hashes
+          String valueHash = hash(value);
+          byte[] jpHash = JpaHashUtils.hashForAttributeValue(value);
+          byte[] jpHashLower = JpaHashUtils.hashForAttributeValueLowerCase(value);
+          
+          if (value.length() > 255) {
+              Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = null, u.longValue = :longValue, u.longValueHash = :longValueHash, u.longValueHashLowerCase = :longValueHashLowerCase WHERE u.id = :id");
+              update.setParameter("id", lockedUae.getId());
+              update.setParameter("longValue", valueHash);
+              update.setParameter("longValueHash", jpHash);
+              update.setParameter("longValueHashLowerCase", jpHashLower);
+              update.executeUpdate();
+          } else {
+              Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = :value, u.longValue = null, u.longValueHash = null, u.longValueHashLowerCase = null WHERE u.id = :id");
+              update.setParameter("id", lockedUae.getId());
+              update.setParameter("value", valueHash);
+              update.executeUpdate();
+          }
+      }
     }
 
     /**
      * Decrypts all existing user entities under a specific realm
      *
-     * @param em EntityManager
+     * @param ksf KeycloakSessionFactory
      * @param realm RealmModel
      */
-    public static void decryptExistingUserEntities(EntityManager em, RealmModel realm) {
-        List<UserEntity> realmUsers = em.createQuery("SELECT u FROM UserEntity u WHERE u.realmId = :realmId", UserEntity.class).setParameter("realmId", realm.getId()).getResultList();
-        for (UserEntity user : realmUsers) {
+    public static void decryptExistingUserEntities(KeycloakSessionFactory ksf, RealmModel realm) {
+        String realmId = realm.getId();
+        
+        // Get all user IDs in a single query
+        KeycloakSession ks = ksf.create();
+        List<String> userIds;
+        try {
+            EntityManager em = ks.getProvider(JpaConnectionProvider.class).getEntityManager();
+            userIds = em.createQuery("SELECT u.id FROM UserEntity u WHERE u.realmId = :realmId ORDER BY u.id", String.class)
+                    .setParameter("realmId", realmId)
+                    .getResultList();
+        } finally {
+            ks.close();
+        }
+        
+        logger.infof("Event: REALM_USERS_DECRYPTION_START, Realm: %s, Total Users: %d", realmId, userIds.size());
+
+        int decryptedCount = 0;
+        int failureCount = 0;
+
+        for (String userId : userIds) {
             try {
-                EncryptedUserEntity eue = getEncryptedUserEntity(em, user, false);
-                if (eue != null) {
-                    decryptUserEntity(em, realm, eue);
-                    logger.debugf("Event: USER_DECRYPTION, Realm: %s, User: %s", realm.getId(), user.getId());
-                }
-                List<EncryptedUserAttributeEntity> encryptedAttributes = em.createQuery("SELECT a FROM EncryptedUserAttributeEntity a WHERE a.user = :user", EncryptedUserAttributeEntity.class).setParameter("user", user).getResultList();
-                for (EncryptedUserAttributeEntity euae : encryptedAttributes) {
-                    decryptUserAttributeEntity(em, realm, euae);
-                }
+                KeycloakModelUtils.runJobInTransaction(ksf, session -> {
+                    EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
+                    UserEntity user = em.find(UserEntity.class, userId);
+                    if (user != null) {
+                        EncryptedUserEntity eue = getEncryptedUserEntity(em, user, false);
+                        if (eue != null) {
+                            decryptUserEntity(em, realm, eue);
+                            logger.debugf("Event: USER_DECRYPTION, Realm: %s, User: %s", realmId, userId);
+                        }
+                        List<EncryptedUserAttributeEntity> encryptedAttributes = em.createQuery("SELECT a FROM EncryptedUserAttributeEntity a WHERE a.user = :user", EncryptedUserAttributeEntity.class)
+                                .setParameter("user", user)
+                                .getResultList();
+                        for (EncryptedUserAttributeEntity euae : encryptedAttributes) {
+                            decryptUserAttributeEntity(em, realm, euae);
+                        }
+                    }
+                });
+                decryptedCount++;
             } catch (DecryptionFailureException ex) {
+                failureCount++;
                 ex.outputToLog(logger);
+            } catch (RuntimeException ex) {
+                failureCount++;
+                logger.errorf(ex, "Event: USER_DECRYPTION_FAILED, Realm: %s, User: %s, Error: %s", realmId, userId, ex.getMessage());
+            }
+
+            int processed = decryptedCount + failureCount;
+            if (processed % ENCRYPTION_PROGRESS_INTERVAL == 0) {
+                logger.infof("Event: REALM_USERS_DECRYPTION_PROGRESS, Realm: %s, Processed: %d/%d, Decrypted: %d, Failed: %d",
+                        realmId, processed, userIds.size(), decryptedCount, failureCount);
             }
         }
+
+        logger.infof("Event: REALM_USERS_DECRYPTION_COMPLETE, Realm: %s, Decrypted: %d, Failed: %d",
+                realmId, decryptedCount, failureCount);
     }
 
     /**
@@ -359,25 +551,80 @@ public final class LogicUtils {
      * @param eue EncryptedUserEntity
      */
     public static void decryptUserEntity(EntityManager em, RealmModel realm, EncryptedUserEntity eue) {
-        UserEntity user = eue.getUser();
+    //     UserEntity user = eue.getUser();
+    //     PiiCipher cipher = PiiCipher.getInstance();
+    //     String username = cipher.decryptString(eue.getUsername(), aad(user.getId(), "username"));
+    //     if (!user.getUsername().equalsIgnoreCase(username)) {
+    //         throw new DecryptionFailureException(realm.getId(), user.getId());
+    //     }
+    //     Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
+    //     update.setParameter("id", user.getId());
+    //     update.setParameter("username", username);
+    //     String decryptedEmail = cipher.decryptString(eue.getEmail(), aad(user.getId(), "email"));
+    //     update.setParameter("email", decryptedEmail);
+    //     if (!realm.isDuplicateEmailsAllowed()) {
+    //         update.setParameter("emailConstraint", decryptedEmail);
+    //     } else {
+    //         update.setParameter("emailConstraint", user.getEmailConstraint()); // basically no change
+    //     }
+    //     update.setParameter("firstName", cipher.decryptString(eue.getFirstName(), aad(user.getId(), "firstName")));
+    //     update.setParameter("lastName", cipher.decryptString(eue.getLastName(), aad(user.getId(), "lastName")));
+    //     update.executeUpdate();
+    //     em.remove(eue);
+        
+        // Re-fetch and lock to prevent concurrent modifications
+        UserEntity user = em.find(UserEntity.class, eue.getUser().getId(), LockModeType.PESSIMISTIC_WRITE);
+        if (user == null) {
+            return;
+        }
+        
         PiiCipher cipher = PiiCipher.getInstance();
-        String username = cipher.decryptString(eue.getUsername(), aad(user.getId(), "username"));
-        if (!user.getUsername().equalsIgnoreCase(username)) {
+        
+        // Decrypt all fields
+        String decryptedUsername = cipher.decryptString(eue.getUsername(), aad(user.getId(), "username"));
+        String decryptedEmail = cipher.decryptString(eue.getEmail(), aad(user.getId(), "email"));
+        String decryptedFirstName = cipher.decryptString(eue.getFirstName(), aad(user.getId(), "firstName"));
+        String decryptedLastName = cipher.decryptString(eue.getLastName(), aad(user.getId(), "lastName"));
+        
+        // Validate username hash matches
+        if (!matchesHash(user.getUsername(), decryptedUsername)) {
             throw new DecryptionFailureException(realm.getId(), user.getId());
         }
+        
+        // Validate email hash matches (handle empty string case)
+        String emailNormalized = decryptedEmail != null && !decryptedEmail.isBlank() ? decryptedEmail : "";
+        // Always validate email hash, even if empty
+        if (!matchesHash(user.getEmail(), emailNormalized)) {
+            throw new DecryptionFailureException(realm.getId(), user.getId());
+        }
+        
+        // Validate firstName and lastName hashes
+        if (!matchesHash(user.getFirstName(), decryptedFirstName)) {
+            throw new DecryptionFailureException(realm.getId(), user.getId());
+        }
+        if (!matchesHash(user.getLastName(), decryptedLastName)) {
+            throw new DecryptionFailureException(realm.getId(), user.getId());
+        }
+        
+        // All validations passed, update with decrypted values
         Query update = em.createQuery("UPDATE UserEntity u SET u.username = :username, u.email = :email, u.emailConstraint = :emailConstraint, u.firstName = :firstName, u.lastName = :lastName WHERE u.id = :id");
         update.setParameter("id", user.getId());
-        update.setParameter("username", username);
-        String decryptedEmail = cipher.decryptString(eue.getEmail(), aad(user.getId(), "email"));
-        update.setParameter("email", decryptedEmail);
+        update.setParameter("username", decryptedUsername);
+        
+        // Restore email with proper null handling
+        update.setParameter("email", emailNormalized.isEmpty() ? null : emailNormalized);
+        
+        // Restore emailConstraint based on realm config
         if (!realm.isDuplicateEmailsAllowed()) {
-            update.setParameter("emailConstraint", decryptedEmail);
+            update.setParameter("emailConstraint", emailNormalized.isEmpty() ? user.getId() : emailNormalized);
         } else {
-            update.setParameter("emailConstraint", user.getEmailConstraint()); // basically no change
+            update.setParameter("emailConstraint", user.getId()); // Use user ID for non-duplicate realms
         }
-        update.setParameter("firstName", cipher.decryptString(eue.getFirstName(), aad(user.getId(), "firstName")));
-        update.setParameter("lastName", cipher.decryptString(eue.getLastName(), aad(user.getId(), "lastName")));
+        
+        update.setParameter("firstName", decryptedFirstName);
+        update.setParameter("lastName", decryptedLastName);
         update.executeUpdate();
+        
         em.remove(eue);
     }
 
@@ -389,22 +636,81 @@ public final class LogicUtils {
      * @param euae EncryptedUserAttributeEntity
      */
     public static void decryptUserAttributeEntity(EntityManager em, RealmModel realm, EncryptedUserAttributeEntity euae) {
+        // UserAttributeEntity uae = euae.getAttribute();
+        // String value = PiiCipher.getInstance().decryptString(euae.getValue(), attributeAad(euae.getUser().getId(), euae.getName()));
+        //
+        // String storedValue = uae.getValue();
+        // if (storedValue == null || !value.equalsIgnoreCase(storedValue)) {
+        //     throw new DecryptionFailureException(realm.getId(), euae.getUser().getId(), euae.getName());
+        // }
+        //
+        // if (value.length() > 255) {
+        //     Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = null, u.longValue = :longValue, u.longValueHash = :longValueHash, u.longValueHashLowerCase = :longValueHashLowerCase WHERE u.id = :id");
+        //     update.setParameter("id", uae.getId());
+        //     update.setParameter("longValue", value);
+        //     update.setParameter("longValueHash", JpaHashUtils.hashForAttributeValue(value));
+        //     update.setParameter("longValueHashLowerCase", JpaHashUtils.hashForAttributeValueLowerCase(value));
+        //     update.executeUpdate();
+        // } else {
+        //     Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = :value, u.longValue = null, u.longValueHash = null, u.longValueHashLowerCase = null WHERE u.id = :id");
+        //     update.setParameter("id", uae.getId());
+        //     update.setParameter("value", value);
+        //     update.executeUpdate();
+        // }
+        // em.remove(euae);
+
         UserAttributeEntity uae = euae.getAttribute();
-        String value = PiiCipher.getInstance().decryptString(euae.getValue(), attributeAad(euae.getUser().getId(), euae.getName()));
-        if (!value.equalsIgnoreCase(uae.getValue())) {
+        
+        // Re-fetch and lock to prevent concurrent modifications
+        UserAttributeEntity lockedUae = em.find(UserAttributeEntity.class, uae.getId(), LockModeType.PESSIMISTIC_WRITE);
+        if (lockedUae == null) {
+            return;
+        }
+        
+        String decryptedValue = PiiCipher.getInstance().decryptString(euae.getValue(), attributeAad(euae.getUser().getId(), euae.getName()));
+        
+        // Determine which stored value to validate against. Values longer than
+        // 255 characters are stored in LONG_VALUE instead of VALUE, and Keycloak
+        // keeps LONG_VALUE and its hashes private on UserAttributeEntity with no
+        // getters, so they are read with a native query.
+        String storedValue;
+        boolean isLongValue;
+        List<?> longValueRows = em.createNativeQuery("SELECT LONG_VALUE, LONG_VALUE_HASH FROM USER_ATTRIBUTE WHERE ID = :id")
+                .setParameter("id", lockedUae.getId())
+                .getResultList();
+        Object[] longValueRow = longValueRows.isEmpty() ? null : (Object[]) longValueRows.get(0);
+        if (longValueRow != null && longValueRow[0] != null) {
+            isLongValue = true;
+            storedValue = (String) longValueRow[0];
+
+            // Verify the JPA attribute lookup hash if it was stored
+            if (longValueRow[1] instanceof byte[] storedJpaHash
+                    && !Arrays.equals(storedJpaHash, JpaHashUtils.hashForAttributeValue(decryptedValue))) {
+                throw new DecryptionFailureException(realm.getId(), euae.getUser().getId(), euae.getName());
+            }
+        } else {
+            isLongValue = false;
+            storedValue = lockedUae.getValue();
+        }
+
+        // Validate decrypted value matches the stored blind index hash
+        if (storedValue == null
+                || (isLongValue ? !storedValue.equalsIgnoreCase(hash(decryptedValue)) : !matchesHash(storedValue, decryptedValue))) {
             throw new DecryptionFailureException(realm.getId(), euae.getUser().getId(), euae.getName());
         }
-        if (value.length() > 255) {
+        
+        // Update with original decrypted value
+        if (decryptedValue.length() > 255) {
             Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = null, u.longValue = :longValue, u.longValueHash = :longValueHash, u.longValueHashLowerCase = :longValueHashLowerCase WHERE u.id = :id");
-            update.setParameter("id", uae.getId());
-            update.setParameter("longValue", value);
-            update.setParameter("longValueHash", JpaHashUtils.hashForAttributeValue(value));
-            update.setParameter("longValueHashLowerCase", JpaHashUtils.hashForAttributeValueLowerCase(value));
+            update.setParameter("id", lockedUae.getId());
+            update.setParameter("longValue", decryptedValue);
+            update.setParameter("longValueHash", JpaHashUtils.hashForAttributeValue(decryptedValue));
+            update.setParameter("longValueHashLowerCase", JpaHashUtils.hashForAttributeValueLowerCase(decryptedValue));
             update.executeUpdate();
         } else {
             Query update = em.createQuery("UPDATE UserAttributeEntity u SET u.value = :value, u.longValue = null, u.longValueHash = null, u.longValueHashLowerCase = null WHERE u.id = :id");
-            update.setParameter("id", uae.getId());
-            update.setParameter("value", value);
+            update.setParameter("id", lockedUae.getId());
+            update.setParameter("value", decryptedValue);
             update.executeUpdate();
         }
         em.remove(euae);

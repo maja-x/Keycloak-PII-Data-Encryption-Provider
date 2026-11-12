@@ -54,4 +54,10 @@
     <changeSet author="mlukman" id="20250213-1">
         <modifyDataType tableName="USER_ATTRIBUTE_ENCRYPTED" columnName="VALUE" newDataType="NCLOB"/>
     </changeSet>
+    <changeSet author="mlukman" id="20261111-1">
+        <modifyDataType tableName="USER_ENTITY_ENCRYPTED" columnName="USERNAME" newDataType="NCLOB"/>
+        <modifyDataType tableName="USER_ENTITY_ENCRYPTED" columnName="EMAIL" newDataType="NCLOB"/>
+        <modifyDataType tableName="USER_ENTITY_ENCRYPTED" columnName="FIRST_NAME" newDataType="NCLOB"/>
+        <modifyDataType tableName="USER_ENTITY_ENCRYPTED" columnName="LAST_NAME" newDataType="NCLOB"/>
+    </changeSet>
 </databaseChangeLog>

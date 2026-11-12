@@ -153,14 +153,13 @@ class PiiCipherTest {
     }
 
     @Test
-    void testCiphertextOfAMaximumLengthUsernameFitsTheColumn() {
+    void testCiphertextOfAMaximumLengthMultibyteUsernameRoundTrips() {
         PiiCipher cipher = PiiCipher.fromEnv();
-        String username = "u".repeat(255);
+        // 255 characters of 3 bytes each, the worst case the USER_ENTITY columns allow
+        String username = "\u0e01".repeat(255);
 
         String protectedValue = cipher.encryptString(username, AAD);
 
-        // USER_ENTITY_ENCRYPTED.USERNAME is VARCHAR(500)
-        assertTrue(protectedValue.length() <= 500, "serialized value is " + protectedValue.length() + " characters long");
         assertEquals(username, cipher.decryptString(protectedValue, AAD));
     }
 
