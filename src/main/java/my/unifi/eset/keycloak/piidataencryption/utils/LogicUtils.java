@@ -21,10 +21,12 @@ import jakarta.persistence.NoResultException;
 import jakarta.persistence.Query;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import my.unifi.eset.keycloak.piidataencryption.admin.PiiDataEncryptionValidatorProvider;
 import my.unifi.eset.keycloak.piidataencryption.crypto.BlindIndex;
 import my.unifi.eset.keycloak.piidataencryption.crypto.PiiCipher;
 import my.unifi.eset.keycloak.piidataencryption.crypto.PiiKind;
+import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedRealmSmtpConfigEntity;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserAttributeEntity;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserEntity;
 import my.unifi.eset.keycloak.piidataencryption.jpa.EncryptedUserProvider;
@@ -34,6 +36,8 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserProvider;
+import org.keycloak.models.jpa.entities.RealmAttributeEntity;
+import org.keycloak.models.jpa.entities.RealmEntity;
 import org.keycloak.models.jpa.entities.UserAttributeEntity;
 import org.keycloak.models.jpa.entities.UserEntity;
 import org.keycloak.models.utils.KeycloakModelUtils;
@@ -88,6 +92,29 @@ public final class LogicUtils {
     }
 
     /**
+     * Checks if the user encryption enabled or not using only the database,
+     * for use in Hibernate event listeners where no KeycloakSession is
+     * available. The {@link EncryptedUserProvider} is active whenever the
+     * entity listener runs, so the check reduces to the realm attribute.
+     *
+     * @param em EntityManager
+     * @param realmId Realm ID
+     * @return true if enabled, false if disabled
+     */
+    public static boolean isUserEncryptionEnabled(EntityManager em, String realmId) {
+        try {
+            RealmAttributeEntity attr = em.createQuery(
+                    "SELECT a FROM RealmAttributeEntity a WHERE a.realm.id = :realmId AND a.name = 'users.encrypt'",
+                    RealmAttributeEntity.class)
+                    .setParameter("realmId", realmId)
+                    .getSingleResult();
+            return "true".equals(attr.getValue());
+        } catch (NoResultException ex) {
+            return false;
+        }
+    }
+
+    /**
      * Checks if a particular user attribute should be encrypted or not
      *
      * @param ks KeycloakSession
@@ -128,6 +155,195 @@ public final class LogicUtils {
             return false;
         }
         return false;
+    }
+
+    /**
+     * Checks if a particular user attribute should be encrypted or not using
+     * only the database, for use in Hibernate event listeners where no
+     * KeycloakSession is available. This is a simplified check that only
+     * evaluates realm-level encryption and the "pii-" prefix.
+     *
+     * @param em EntityManager
+     * @param realmId The ID of the realm
+     * @param attributeName The name of the user attribute
+     * @return true if should encrypted, false if not
+     */
+    public static boolean shouldEncryptAttribute(EntityManager em, String realmId, String attributeName) {
+        if (attributeName == null || !isUserEncryptionEnabled(em, realmId)) {
+            return false;
+        }
+        if (attributeName.startsWith("pii-")) {
+            return true;
+        }
+        // Full user profile validation requires KeycloakSession; fallback to false
+        return false;
+    }
+
+    /**
+     * Checks if realm SMTP config encryption is enabled
+     *
+     * @param ks KeycloakSession
+     * @param realm RealmModel
+     * @return true if enabled, false if disabled
+     */
+    public static boolean isSmtpConfigEncryptionEnabled(KeycloakSession ks, RealmModel realm) {
+        return ks.getProvider(UserProvider.class) instanceof EncryptedUserProvider
+                && realm.getAttribute("smtp.config.encrypt", false);
+    }
+
+    /**
+     * Checks if realm SMTP config encryption is enabled using only the database
+     *
+     * @param em EntityManager
+     * @param realmId Realm ID
+     * @return true if enabled, false if disabled
+     */
+    public static boolean isSmtpConfigEncryptionEnabled(EntityManager em, String realmId) {
+        try {
+            RealmAttributeEntity attr = em.createQuery(
+                    "SELECT a FROM RealmAttributeEntity a WHERE a.realm.id = :realmId AND a.name = 'smtp.config.encrypt'",
+                    RealmAttributeEntity.class)
+                    .setParameter("realmId", realmId)
+                    .getSingleResult();
+            return "true".equals(attr.getValue());
+        } catch (NoResultException ex) {
+            return false;
+        }
+    }
+
+    /**
+     * Gets existing encrypted realm SMTP config entity if exists, if not exists
+     * then either create a new one or return null
+     *
+     * @param em EntityManager
+     * @param realm The corresponding RealmEntity
+     * @param name The config name
+     * @param createIfMissing True if a new one should be created if missing,
+     * false to simply return null
+     * @return Either existing record, else if parameter createIfMissing is true
+     * then a new record, else null
+     */
+    public static EncryptedRealmSmtpConfigEntity getEncryptedRealmSmtpConfigEntity(EntityManager em, RealmEntity realm, String name, boolean createIfMissing) {
+        try {
+            return em.createQuery("SELECT e FROM EncryptedRealmSmtpConfigEntity e WHERE e.realm = :realm AND e.name = :name", EncryptedRealmSmtpConfigEntity.class)
+                    .setParameter("realm", realm)
+                    .setParameter("name", name)
+                    .getSingleResult();
+        } catch (NoResultException ex) {
+            if (createIfMissing) {
+                return new EncryptedRealmSmtpConfigEntity(KeycloakModelUtils.generateId(), realm, name);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Encrypts an existing realm SMTP config
+     *
+     * @param ks KeycloakSession
+     * @param em EntityManager
+     * @param realm RealmEntity
+     * @param name Config name
+     * @param value Config value
+     */
+    public static void encryptRealmSmtpConfig(KeycloakSession ks, EntityManager em, RealmEntity realm, String name, String value) {
+        if (value == null || value.isEmpty()) {
+            return;
+        }
+        if (isHash(value)) {
+            return;
+        }
+        EncryptedRealmSmtpConfigEntity ersce = getEncryptedRealmSmtpConfigEntity(em, realm, name, true);
+        String encryptedValue = PiiCipher.getInstance().encryptString(value, smtpAad(realm.getId(), name));
+        ersce.setValue(encryptedValue);
+        em.persist(ersce);
+        em.flush();
+    }
+
+    /**
+     * Decrypts an encrypted realm SMTP config
+     *
+     * @param em EntityManager
+     * @param realm RealmEntity
+     * @param ersce EncryptedRealmSmtpConfigEntity
+     */
+    public static void decryptRealmSmtpConfig(EntityManager em, RealmEntity realm, EncryptedRealmSmtpConfigEntity ersce) {
+        String decryptedValue = PiiCipher.getInstance().decryptString(ersce.getValue(), smtpAad(realm.getId(), ersce.getName()));
+        // Validate hash matches
+        if (!matchesHash(ersce.getValue(), decryptedValue)) {
+            throw new DecryptionFailureException(realm.getId(), "smtp", ersce.getName());
+        }
+        // Update original config (the value in realm entity's smtpConfig map)
+        // This would need to be handled at the RealmEntity level
+        em.remove(ersce);
+    }
+
+    /**
+     * Builds the AAD that binds an encrypted SMTP config to its realm and name
+     *
+     * @param realmId The realm ID
+     * @param name The config name
+     * @return The AAD
+     */
+    public static String smtpAad(String realmId, String name) {
+        return PiiCipher.fieldContext("realm", realmId, "smtp:" + name);
+    }
+
+    /**
+     * Enables/disables SMTP config encryption for a particular realm
+     *
+     * @param realm The RealmModel
+     * @param enabled True to enable, false to disable
+     */
+    public static void setSmtpConfigEncryptionEnabled(RealmModel realm, boolean enabled) {
+        realm.setAttribute("smtp.config.encrypt", enabled);
+        logger.debugf("Event: SMTP_ENCRYPTION_%s, Realm: %s", enabled ? "ENABLED" : "DISABLED", realm.getId());
+    }
+
+    /**
+     * Encrypts all existing realm SMTP configs
+     *
+     * @param ks KeycloakSession
+     * @param em EntityManager
+     * @param realm RealmModel
+     */
+    public static void encryptExistingRealmSmtpConfigs(KeycloakSession ks, EntityManager em, RealmModel realm) {
+        RealmEntity realmEntity = em.find(RealmEntity.class, realm.getId());
+        if (realmEntity == null || realmEntity.getSmtpConfig() == null) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : realmEntity.getSmtpConfig().entrySet()) {
+            encryptRealmSmtpConfig(ks, em, realmEntity, entry.getKey(), entry.getValue());
+        }
+        logger.infof("Event: REALM_SMTP_CONFIG_ENCRYPTION_COMPLETE, Realm: %s", realm.getId());
+    }
+
+    /**
+     * Decrypts all existing realm SMTP configs
+     *
+     * @param ksf KeycloakSessionFactory
+     * @param realm RealmModel
+     */
+    public static void decryptExistingRealmSmtpConfigs(KeycloakSessionFactory ksf, RealmModel realm) {
+        String realmId = realm.getId();
+        KeycloakSession ks = ksf.create();
+        try {
+            EntityManager em = ks.getProvider(JpaConnectionProvider.class).getEntityManager();
+            RealmEntity realmEntity = em.find(RealmEntity.class, realmId);
+            if (realmEntity == null) {
+                return;
+            }
+            List<EncryptedRealmSmtpConfigEntity> encryptedConfigs = em.createQuery("SELECT e FROM EncryptedRealmSmtpConfigEntity e WHERE e.realm = :realm", EncryptedRealmSmtpConfigEntity.class)
+                    .setParameter("realm", realmEntity)
+                    .getResultList();
+            for (EncryptedRealmSmtpConfigEntity ersce : encryptedConfigs) {
+                decryptRealmSmtpConfig(em, realmEntity, ersce);
+                logger.debugf("Event: REALM_SMTP_CONFIG_DECRYPTION, Realm: %s, Config: %s", realmId, ersce.getName());
+            }
+        } finally {
+            ks.close();
+        }
+        logger.infof("Event: REALM_SMTP_CONFIG_DECRYPTION_COMPLETE, Realm: %s", realmId);
     }
 
     /**

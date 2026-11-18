@@ -1,1 +1,2 @@
 my.unifi.eset.keycloak.piidataencryption.admin.UserEntityEncryptionConfigurationProvider
+my.unifi.eset.keycloak.piidataencryption.admin.SmtpConfigEncryptionConfigurationProvider
